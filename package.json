@@ -1,0 +1,68 @@
+{
+  "name": "cguard",
+  "displayName": "CGuard",
+  "description": "Find definite mistakes in C source and explain how to correct them.",
+  "version": "0.1.0",
+  "publisher": "leekmny",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leekmny/CGuard.git"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Linters"
+  ],
+  "keywords": [
+    "c",
+    "static-analysis",
+    "diagnostics"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:c",
+    "onStartupFinished"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "cguard.checkCurrentFile",
+        "title": "Check Current C File",
+        "category": "CGuard"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-grammar.cjs",
+    "test": "npm run build && node --test tests/analyzer.test.cjs",
+    "vscode:prepublish": "npm run build",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "web-tree-sitter": "0.27.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/vscode": "1.95.0",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "4.1.1",
+    "tree-sitter-c": "0.24.1",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "@vscode/vsce": {
+      "minimatch": "11.0.9"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+.github/**
+.gitignore
+.vscodeignore
+src/**
+scripts/**
+tests/**
+fixtures/**
+verification/**
+tsconfig.json
+out/**/*.map
+node_modules/web-tree-sitter/**/*.map
+node_modules/web-tree-sitter/debug/**
+package-lock.json
+*.vsix
