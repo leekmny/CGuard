@@ -1,5 +1,7 @@
 # CGuard
 
+**한국어** | [English](README.en.md)
+
 CGuard는 C 소스 코드의 오류를 찾아 **파일의 해당 위치와 VS Code Problems 패널**에 원인과 수정 방법을 표시합니다. 소스는 현재 VS Code 프로세스에서 정적으로 검사합니다.
 
 ## 사용 방법
