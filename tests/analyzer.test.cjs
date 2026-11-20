@@ -103,6 +103,100 @@ test('treats a conditional declaration as an unknown shadow', async () => {
   assert.deepEqual(await analyzeText(source), []);
 });
 
+test('keeps visible array bounds through linked declarations with omitted sizes', async () => {
+  const source = `static int rows[2][4];
+  extern int rows[][4];
+  int f(void) { return rows[2][0]; }
+  int g(void) { extern int rows[][4]; return rows[0][4] + rows[3][0]; }
+  int h(void) { int rows[][4] = {{0}, {0}, {0}}; return rows[2][0]; }
+  int j(int *rows) { extern int other[]; return rows[5] + other[5]; }
+  `;
+  const findings = await findingsFor(source, 'array-index-out-of-bounds');
+
+  assert.deepEqual(findings.map((finding) => highlight(source, finding)), ['2', '4', '3']);
+});
+
+test('does not restore bounds from a shadowed or conditional declaration', async () => {
+  const source = `int a[2];
+  int g(void) { int a[6]; { extern int a[]; return a[4]; } }
+  extern int b[2];
+  #if FLAG
+    extern int b[2];
+  #endif
+  extern int b[];
+  int h(void) { return b[4]; }
+  `;
+
+  assert.deepEqual(await analyzeText(source), []);
+});
+
+test('checks evaluated declarator sizes before the name starts shadowing', async () => {
+  const source = `int a[2];
+  void prototype(int p[a[9]]);
+  int f(int p[a[2]], int *a, int q[a[8]]) { return 0; }
+  int g(void) {
+    int a[a[3]];
+    return 0;
+  }
+  int h(void) {
+    int (*p)[a[4]];
+    typedef int Buffer[a[5]];
+    return 0;
+  }
+  `;
+  const findings = await findingsFor(source, 'array-index-out-of-bounds');
+
+  assert.deepEqual(findings.map((finding) => highlight(source, finding)), ['2', '3', '4', '5']);
+});
+
+test('checks sizeof operands only when the tracked array size requires evaluation', async () => {
+  const source = `int f(int length) {
+    int a[2], fixed[2][3], variable[2][length];
+    return sizeof(int[a[4]]) + sizeof(int (*)[a[5]])
+      + sizeof(fixed[6]) + sizeof(variable[7]) + sizeof(variable[8][0])
+      + _Alignof(int[a[9]]);
+  }`;
+  const findings = await findingsFor(source, 'array-index-out-of-bounds');
+
+  assert.deepEqual(findings.map((finding) => highlight(source, finding)), ['4', '7']);
+});
+
+test('checks selected generic arms and skips unevaluated or unresolved arms', async () => {
+  const source = `typedef long alias;
+  int f(float value) {
+    int a[2];
+    int *end = &_Generic(0, int: a[2]);
+    return _Generic(1, signed /* same type */ int: a[3], default: a[4])
+      + _Generic(1, double: a[5], default: a[6])
+      + _Generic(value, float: a[7], default: a[8])
+      + _Generic(1, alias: a[9], default: a[10])
+      + _Generic(a[11], default: a[12]) + (int)(end - a)
+      + _Generic(1L, int: a[13], long: 0, default: a[14]);
+  }`;
+  const findings = await findingsFor(source, 'array-index-out-of-bounds');
+
+  assert.deepEqual(findings.map((finding) => highlight(source, finding)), ['3', '6', '12']);
+});
+
+test('skips the statically unselected operands of short-circuit and conditional expressions', async () => {
+  const source = `int f(int unknown) {
+    int a[2];
+    return (0 && a[3]) + (1 || a[4]) + ((0 && a[5]) && a[6])
+      + (!0 ? a[7] : a[8]) + (0 ? a[9] : a[10]) + (unknown && a[11]);
+  }`;
+  const findings = await findingsFor(source, 'array-index-out-of-bounds');
+
+  assert.deepEqual(findings.map((finding) => highlight(source, finding)), ['7', '10', '11']);
+});
+
+test('resolves evaluated operands in long logical expression chains', async () => {
+  const chain = Array(1000).fill('1').join(' && ');
+  const source = `int f(void) { int a[2]; return ((${chain}) || a[3]) + ((${chain}) && a[4]); }`;
+  const findings = await findingsFor(source, 'array-index-out-of-bounds');
+
+  assert.deepEqual(findings.map((finding) => highlight(source, finding)), ['4']);
+});
+
 test('reports exact UTF-16 offsets after an emoji and Korean characters', async () => {
   const source = 'int f(void) { int a[2] = {0}; /* 🧩 배열 */ return a[2]; }\r\n';
   const findings = await findingsFor(source, 'array-index-out-of-bounds');
