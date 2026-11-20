@@ -1,8 +1,15 @@
 import type { Node } from 'web-tree-sitter';
 import type { Finding } from './analyzer';
 
+interface ArrayDimension {
+  bound: bigint | null;
+  variable: boolean;
+}
+
 interface Binding {
-  bounds: (bigint | null)[];
+  dimensions: ArrayDimension[];
+  linked?: boolean;
+  runtimeInteger?: boolean;
 }
 
 interface Scope {
@@ -10,11 +17,11 @@ interface Scope {
   bindings: Map<string, Binding>;
 }
 
-const unknown: Binding = { bounds: [] };
+const unknown: Binding = { dimensions: [] };
 
 const conditionalDirectives = new Set(['preproc_if', 'preproc_ifdef', 'preproc_elif', 'preproc_elifdef', 'preproc_else']);
-const unevaluatedExpressions = new Set(['sizeof_expression', 'alignof_expression', 'generic_expression', 'typeof_specifier']);
-const declaratorWrappers = new Set(['parenthesized_declarator', 'attributed_declarator']);
+const unevaluatedExpressions = new Set(['alignof_expression', 'typeof_specifier', 'macro_type_specifier']);
+const declaratorWrappers = new Set(['parenthesized_declarator', 'abstract_parenthesized_declarator', 'attributed_declarator']);
 
 export function isConditionalDirective(type: string): boolean {
   return conditionalDirectives.has(type);
@@ -26,6 +33,8 @@ export function analyzeSource(root: Node, findings: Finding[]): void {
       .map((directive) => directive.childForFieldName('name')?.text)
       .filter((name): name is string => name !== undefined),
   );
+
+  const truthCache = new Map<number, boolean | null>();
 
   function visit(node: Node, scope: Scope): void {
     if (node.isError || node.isMissing || unevaluatedExpressions.has(node.type)) {
@@ -50,6 +59,17 @@ export function analyzeSource(root: Node, findings: Finding[]): void {
       visitDeclaration(node, scope);
       return;
     }
+    if (node.type === 'sizeof_expression') {
+      visitSizeof(node, scope);
+      return;
+    }
+    if (node.type === 'generic_expression') {
+      const selected = selectedGenericExpression(node);
+      if (selected) {
+        visit(selected, scope);
+      }
+      return;
+    }
     if (node.type === 'enum_specifier') {
       hideEnumerators(node, scope);
     }
@@ -60,8 +80,46 @@ export function analyzeSource(root: Node, findings: Finding[]): void {
       return;
     }
     const childScope = node.type === 'for_statement' ? newScope(scope) : scope;
-    for (const child of node.namedChildren) {
+    for (const child of evaluatedChildren(node, truthCache)) {
       visit(child, childScope);
+    }
+  }
+
+  function visitSizeof(node: Node, scope: Scope): void {
+    if (node.hasError) {
+      return;
+    }
+    const type = node.childForFieldName('type');
+    if (type) {
+      const { layers } = describeDeclarator(type.childForFieldName('declarator'));
+      for (const layer of layers) {
+        // Dimensions behind a pointer do not affect the result of sizeof.
+        if (layer.type !== 'abstract_array_declarator') {
+          break;
+        }
+        const size = layer.childForFieldName('size');
+        if (size) {
+          visit(size, scope);
+        }
+      }
+      return;
+    }
+    const value = node.childForFieldName('value');
+    const reference = arrayReference(value);
+    if (value && reference && !macros.has(reference.base.text) &&
+        lookup(reference.base.text, scope)?.dimensions.slice(reference.depth).some(({ variable }) => variable)) {
+      visit(value, scope);
+    }
+  }
+
+  function visitDeclaratorSizes(layers: Node[], scope: Scope): void {
+    for (const layer of layers) {
+      if (layer.type === 'array_declarator') {
+        const size = layer.childForFieldName('size');
+        if (size) {
+          visit(size, scope);
+        }
+      }
     }
   }
 
@@ -76,11 +134,21 @@ export function analyzeSource(root: Node, findings: Finding[]): void {
       ?.childForFieldName('parameters');
     const localScope = newScope(scope);
     for (const parameter of parameters?.namedChildren ?? []) {
-      const parameterName = parameter.type === 'identifier'
-        ? parameter
-        : describeDeclarator(parameter.childForFieldName('declarator')).name;
+      const { name: parameterName, layers: parameterLayers } = describeDeclarator(
+        parameter.type === 'identifier' ? parameter : parameter.childForFieldName('declarator'),
+      );
+      const parameterType = parameter.childForFieldName('type');
+      if (parameterType) {
+        visit(parameterType, localScope);
+      }
+      if (!parameter.hasError) {
+        visitDeclaratorSizes(parameterLayers, localScope);
+      }
       if (parameterName) {
-        localScope.bindings.set(parameterName.text, unknown);
+        localScope.bindings.set(parameterName.text, {
+          dimensions: [],
+          runtimeInteger: !parameter.hasError && parameterLayers.length === 0 && isRuntimeInteger(parameter, parameterType),
+        });
       }
     }
     const body = node.childForFieldName('body');
@@ -124,23 +192,41 @@ export function analyzeSource(root: Node, findings: Finding[]): void {
     if (type) {
       visit(type, scope);
     }
+    const linked = !scope.parent || node.namedChildren.some(
+      (child) => child.type === 'storage_class_specifier' && child.text === 'extern',
+    );
     for (const declarator of node.childrenForFieldName('declarator')) {
       const { name, layers } = describeDeclarator(declarator);
       if (!name) {
         continue;
       }
 
-      const bounds: Binding['bounds'] = [];
+      if (!node.hasError) {
+        // The new name is in scope after its complete declarator, including its sizes.
+        visitDeclaratorSizes(layers, scope);
+      }
+      const dimensions: ArrayDimension[] = [];
+      let runtimeInteger = false;
       if (!node.hasError && node.type === 'declaration' && !macros.has(name.text)) {
+        const previous = linked ? lookup(name.text, scope) : undefined;
         for (const layer of layers) {
           if (layer.type !== 'array_declarator') {
             break;
           }
-          const size = integerLiteral(layer.childForFieldName('size'));
-          bounds.push(size !== null && size > 0n ? size : null);
+          const size = layer.childForFieldName('size');
+          const literal = integerLiteral(size);
+          const identifier = unwrapExpression(size);
+          const variable = identifier?.type === 'identifier' && !macros.has(identifier.text) &&
+            lookup(identifier.text, scope)?.runtimeInteger === true;
+          let bound = literal !== null && literal > 0n ? literal : null;
+          if (!size && previous?.linked) {
+            bound = previous.dimensions[dimensions.length]?.bound ?? null;
+          }
+          dimensions.push({ bound, variable });
         }
+        runtimeInteger = layers.length === 0 && isRuntimeInteger(node, type);
       }
-      scope.bindings.set(name.text, { bounds });
+      scope.bindings.set(name.text, { dimensions, linked, runtimeInteger });
 
       const initializer = declarator.childForFieldName('value');
       if (initializer) {
@@ -238,24 +324,16 @@ function checkSubscript(node: Node, scope: Scope, macros: Set<string>, findings:
     return;
   }
 
-  let base = reversed ? unwrapExpression(index) : argument;
-  let dimension = 0;
-  while (base?.type === 'subscript_expression') {
-    const outer = unwrapExpression(base.childForFieldName('argument'));
-    base = outer && integerLiteral(outer) !== null
-      ? unwrapExpression(base.childForFieldName('index'))
-      : outer;
-    dimension++;
-  }
-  if (base?.type !== 'identifier' || macros.has(base.text)) {
+  const reference = arrayReference(reversed ? index : argument);
+  if (!reference || macros.has(reference.base.text)) {
     return;
   }
-
-  const size = lookup(base.text, scope)?.bounds[dimension];
+  const { base, depth } = reference;
+  const size = lookup(base.text, scope)?.dimensions[depth]?.bound;
   if (size == null) {
     return;
   }
-  const address = parentOutsideParens(node);
+  const address = parentOutsideTransparentExpressions(node);
   const formsAddress = address?.type === 'pointer_expression' && address.childForFieldName('operator')?.type === '&';
   const maxIndex = formsAddress ? size : size - 1n;
   if (value >= 0n && value <= maxIndex) {
@@ -272,9 +350,23 @@ function checkSubscript(node: Node, scope: Scope, macros: Set<string>, findings:
   });
 }
 
-function parentOutsideParens(node: Node): Node | null {
+function arrayReference(node: Node | null): { base: Node; depth: number } | null {
+  let base = unwrapExpression(node);
+  let depth = 0;
+  while (base?.type === 'subscript_expression') {
+    const argument = unwrapExpression(base.childForFieldName('argument'));
+    base = argument && integerLiteral(argument) !== null
+      ? unwrapExpression(base.childForFieldName('index'))
+      : argument;
+    depth++;
+  }
+  return base?.type === 'identifier' ? { base, depth } : null;
+}
+
+function parentOutsideTransparentExpressions(node: Node): Node | null {
   let parent = node.parent;
-  while (parent?.type === 'parenthesized_expression') {
+  // A visited generic arm is the selected result, which preserves its lvalue.
+  while (parent?.type === 'parenthesized_expression' || parent?.type === 'generic_expression') {
     parent = parent.parent;
   }
   return parent;
@@ -335,6 +427,95 @@ function integerLiteral(node: Node | null): bigint | null {
     return null;
   }
   return negative ? -magnitude : magnitude;
+}
+
+function evaluatedChildren(node: Node, truthCache: Map<number, boolean | null>): Node[] {
+  if (node.type === 'conditional_expression') {
+    const condition = node.childForFieldName('condition');
+    const truth = constantTruth(condition, truthCache);
+    if (condition && truth !== undefined) {
+      const branch = node.childForFieldName(truth ? 'consequence' : 'alternative');
+      return branch ? [condition, branch] : [condition];
+    }
+  }
+  if (node.type === 'binary_expression') {
+    const operator = node.childForFieldName('operator')?.type;
+    const left = node.childForFieldName('left');
+    if (left && (operator === '&&' || operator === '||') && constantTruth(left, truthCache) === (operator === '||')) {
+      return [left];
+    }
+  }
+  return node.namedChildren;
+}
+
+function constantTruth(node: Node | null, cache: Map<number, boolean | null>): boolean | undefined {
+  node = unwrapExpression(node);
+  if (!node) {
+    return undefined;
+  }
+  const cached = cache.get(node.id);
+  if (cached !== undefined) {
+    return cached ?? undefined;
+  }
+  let truth: boolean | undefined;
+  const operator = node.childForFieldName('operator')?.type;
+  if (node.type === 'unary_expression' && operator === '!') {
+    const argument = constantTruth(node.childForFieldName('argument'), cache);
+    truth = argument === undefined ? undefined : !argument;
+  } else if (node.type === 'binary_expression' && (operator === '&&' || operator === '||')) {
+    const left = constantTruth(node.childForFieldName('left'), cache);
+    if (left !== undefined) {
+      truth = left === (operator === '||') ? left : constantTruth(node.childForFieldName('right'), cache);
+    }
+  } else {
+    const value = integerLiteral(node);
+    truth = value === null ? undefined : value !== 0n;
+  }
+  // The tree walk also visits nested logical expressions. Cache known and unknown
+  // results so each condition is calculated only once in this syntax tree.
+  cache.set(node.id, truth ?? null);
+  return truth;
+}
+
+function selectedGenericExpression(node: Node): Node | undefined {
+  if (node.hasError) {
+    return undefined;
+  }
+  const [control, ...associations] = node.namedChildren.filter((child) => child.type !== 'comment');
+  const literal = unwrapExpression(control ?? null);
+  const value = integerLiteral(literal);
+  // Unsuffixed literals in this range have type int even when int is 16 bits.
+  const knownInt = literal?.type === 'number_literal' && !/[ul]$/i.test(literal.text) &&
+    value !== null && value >= -32_767n && value <= 32_767n;
+  let fallback: Node | undefined;
+  let mayMatch = false;
+  for (let i = 0; i < associations.length; i += 2) {
+    const type = associations[i];
+    if (type.text === 'default') {
+      fallback = associations[i + 1];
+      continue;
+    }
+    const plain = type.namedChildren.filter((child) => child.type !== 'comment').length === 1
+      ? type.childForFieldName('type')
+      : null;
+    const spelling = plain?.type === 'sized_type_specifier'
+      ? plain.children.filter((child) => child.type !== 'comment').map((child) => child.text).join(' ')
+      : plain?.text ?? '';
+    if (knownInt && /^(int|signed( int)?|int signed)$/.test(spelling)) {
+      return associations[i + 1];
+    }
+    // An unresolved association, for example through a typedef or enum, may match int.
+    if (!knownInt || !plain || !/^(?:(?:signed|unsigned|long|short|int) )*(?:float|double|char|bool|_Bool|unsigned|long|short|int|signed)$/.test(spelling) ||
+        (plain.type !== 'primitive_type' && plain.type !== 'sized_type_specifier')) {
+      mayMatch = true;
+    }
+  }
+  return mayMatch ? undefined : fallback;
+}
+
+function isRuntimeInteger(declaration: Node, type: Node | null): boolean {
+  return !!type && /^(?:(?:int|long|short|signed|unsigned|char)\s+)*(?:int|long|short|signed|unsigned|char|_Bool)$/.test(type.text) &&
+    !declaration.namedChildren.some((child) => child.type === 'type_qualifier' && child.text === 'constexpr');
 }
 
 function isPlainScalar(declaration: Node, type: Node | null): boolean {

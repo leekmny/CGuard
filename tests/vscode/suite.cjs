@@ -93,6 +93,18 @@ exports.run = async function run() {
     assert.equal(await fs.readFile(invalid.uri.fsPath, 'utf8'), validText);
     await waitForDiagnostics(invalid, 0);
 
+    const redeclaration = vscode.Uri.joinPath(workspace.uri, 'array-redeclaration.c');
+    await fs.writeFile(redeclaration.fsPath,
+        'int items[3];\nextern int items[];\nint f(void) { return items[3]; }\n');
+    const redeclarationDocument = await vscode.workspace.openTextDocument(redeclaration);
+    await vscode.window.showTextDocument(redeclarationDocument);
+    await vscode.commands.executeCommand(command);
+    const [redeclarationDiagnostic] = await waitForDiagnostics(redeclarationDocument, 1);
+    assert.equal(redeclarationDiagnostic.code, 'array-index-out-of-bounds');
+    assert.equal(redeclarationDiagnostic.severity, vscode.DiagnosticSeverity.Error);
+    assert.equal(redeclarationDocument.getText(redeclarationDiagnostic.range), '3');
+    assert.match(redeclarationDiagnostic.message, /items \(size 3\)/);
+
     await fs.writeFile(process.env.CGUARD_TEST_EVIDENCE, JSON.stringify({
         vscodeVersion: vscode.version,
         extensionId: extension.id,
@@ -104,6 +116,7 @@ exports.run = async function run() {
         validDiagnosticCount: 0,
         manualDiagnostic,
         savedInvalidDiagnostic,
+        redeclarationDiagnostic: redeclarationDiagnostic.message,
         fixedDiagnosticCount: diagnosticsFor(invalid).length,
     }));
 };

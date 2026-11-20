@@ -2,7 +2,7 @@
   "name": "cguard",
   "displayName": "CGuard",
   "description": "Find definite mistakes in C source and explain how to correct them.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "leekmny",
   "license": "UNLICENSED",
   "repository": {
